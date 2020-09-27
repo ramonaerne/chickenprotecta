@@ -2,7 +2,7 @@
 IoT Chicken Coop Door System
 
 ### Adapting the code
-``````
+```
 cp chickenprotecta-public.ino chickenprotecta.ino
 ```
 and fill out auth token and wifi ssid/password
