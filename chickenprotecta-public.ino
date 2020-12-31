@@ -7,12 +7,27 @@
 #include <ArduinoOTA.h>
 #include "DHT.h"
 
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <TimeLib.h>
+#include <Timezone.h>
+#include <Dusk2Dawn.h>
+#include <time.h>
+#include <arduino-timer.h>
+
+/* ------------------------------------------------------ 
+ *  Defines and constants
+ * ------------------------------------------------------ */
+
 #define D_OPEN_A  0x0
 #define D_CLOSE_A 0x2
 #define S_OPEN_A  0x4
 #define S_CLOSE_A 0x6
 #define D_PREV_A  0x8
 #define S_PREV_A  0xA
+
+#define SUNRISE_OFF_A 0xC
+#define SUNSET_OFF_A  0xE
 
 #define DELAY_ATTACH_MILLI 2000
 #define DELAY_DOOR_MILLI 2000
@@ -22,18 +37,113 @@
 #define SERVO_DOOR_MICRO_MAX 2400
 #define SERVO_MOVEMENT_MAX_MILLI 16000
 
-// You should get Auth Token in the Blynk App.
-// Go to the Project Settings (nut icon).
+#define NTP_SYNC_TIME_SEC 10
+#define TIMER_INTERVAL_SEC 15
+
+#define LOC_LONGITUDE 47.3769 
+#define LOC_LATITUDE  8.5417
+#define LOC_TIMEZONE_OFFSET 1
+
+//#define DEBUG 1
+
+char ntp_name[] = "europe.pool.ntp.org";
+
+// Blynk token
 char auth[] = "****";
 
 // Your WiFi credentials.
-// Set password to "" for open networks.
 char ssid[] = "****";
 char pass[] = "****";
+
+
+/* ------------------------------------------------------ 
+ *  Global instances
+ * ------------------------------------------------------ */
 Servo s_door, s_slider;
 //DHT dht(D5, DHT22);
 
+WidgetTerminal terminal(V6);
+
+auto timer = timer_create_default();
+Dusk2Dawn location(LOC_LONGITUDE, LOC_LATITUDE, LOC_TIMEZONE_OFFSET);
+
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, ntp_name, 0, NTP_SYNC_TIME_SEC * 1000);
+TimeChangeRule CEST = {"CEST", Last, Sun, Mar, 2, 120};     // Central European Summer Time
+TimeChangeRule CET = {"CET ", Last, Sun, Oct, 3, 60};       // Central European Standard Time
+Timezone CE(CEST, CET);
+
+void move_door(int button);
+
+/* ------------------------------------------------------ 
+ *  Time/NTP and Sunset/Sunrise helper functions
+ * ------------------------------------------------------ */
+
+static tm getDateTimeByParams(long time){
+    struct tm *newtime;
+    const time_t tim = time;
+    newtime = localtime(&tim);
+    return *newtime;
+}
+
+int getMinutesSinceMidnighteLoc() {
+  tm loc;
+  loc = getDateTimeByParams(CE.toLocal(now()));
+  Serial.printf("%d %d %d %d:%d\n", loc.tm_year + 1900, loc.tm_mon+1, loc.tm_mday, loc.tm_hour, loc.tm_min);
+  return loc.tm_hour * 60 + loc.tm_min;
+}
+
+static bool isSunUp() {
+
+  int minsSinceMidnight = getMinutesSinceMidnighteLoc();
+  
+  int sunrise = location.sunrise(year(), month(), day(), CE.utcIsDST(now()));
+  int sunset = location.sunset(year(), month(), day(), CE.utcIsDST(now()));
+#ifdef DEBUG
+  Serial.printf("sunrise %d:%d\n", sunrise / 60, sunrise % 60);
+  Serial.printf("sunset %d:%d\n", sunset / 60, sunset % 60);
+  Serial.printf("now %d:%d\n", minsSinceMidnight / 60, minsSinceMidnight % 60);
+#else
+  terminal.printf("sunrise %d:%d\n", sunrise / 60, sunrise % 60);
+  terminal.printf("sunset %d:%d\n", sunset / 60, sunset % 60);
+  terminal.flush();
+#endif
+  bool sunUp = (minsSinceMidnight > sunrise) && (minsSinceMidnight < sunset);
+  Serial.printf("door open: %d\n", sunUp);
+  return sunUp;
+}
+
+bool updateTimeAndDoTask(void *) {
+
+  // manual update of clock since setsyncprovider
+  // does not work correctly
+  if (timeClient.update()){
+     Serial.println ( "Update clock" );
+     setTime(timeClient.getEpochTime());   
+  } else{
+     Serial.println ( "NTP Update not WORK!!" );
+  }
+
+  bool sunup = isSunUp();
+
+  // calculate doorUp from sunup
+  bool doorUp = sunup;
+
+  // todo: do something here
+  Blynk.virtualWrite(V2, (int) doorUp);
+  move_door(doorUp);
+  
+  return true; // keep timer running
+}
+
+/* ------------------------------------------------------ 
+ *  Servo member functions and Blynk macros
+ * ------------------------------------------------------ */
+
 int getApproximateServoDelay(int old_pos, int new_pos) {
+  // todo remove
+  return 1000;
+  
   int diff = abs(new_pos-old_pos);
   int del = diff * SERVO_MOVEMENT_MAX_MILLI / (SERVO_DOOR_MICRO_MAX-SERVO_DOOR_MICRO_MIN);
   del += DELAY_DOOR_MILLI;
@@ -59,8 +169,8 @@ void writeEEPROM(int address, int val) {
 
 BLYNK_WRITE(V0) // door min
 {
-  s_door.attach(D1);
-  s_slider.attach(D2);
+  s_door.attach(D3); // d1
+  s_slider.attach(D4); // d2
   int data = param.asInt();
  Serial.printf("V0 %d\n", data);
   // s_door.writeMicroseconds(data);
@@ -71,8 +181,8 @@ BLYNK_WRITE(V0) // door min
 
 BLYNK_WRITE(V1) // door max
 {
-  s_door.attach(D1);
-  s_slider.attach(D2);
+  s_door.attach(D3);
+  s_slider.attach(D4);
   int data = param.asInt();
   Serial.printf("V1 %d\n", data);
   //s_door.writeMicroseconds(data);
@@ -81,14 +191,30 @@ BLYNK_WRITE(V1) // door max
 
 }
 
+bool get_door_position()
+{
+  int door_milli_up, door_milli_down, door_milli_prev;
+  
+  door_milli_prev = readEEPROM(D_PREV_A);
+  door_milli_up   = readEEPROM(D_OPEN_A);
+  door_milli_down = readEEPROM(D_CLOSE_A);
+
+  return abs(door_milli_prev-door_milli_up) < abs(door_milli_prev - door_milli_down);
+}
+
 void move_door(int button)
 {
   int angle, angle_prev;
   int door_milli, door_milli_prev;
+
+  if(get_door_position() == button) {
+    Serial.print("skip move_door, already in position");
+    return;
+  }
   
   door_milli_prev = readEEPROM(D_PREV_A);
-  s_door.attach(D1);
-  s_slider.attach(D2);
+  s_door.attach(D3);
+  s_slider.attach(D4);
   delay(DELAY_ATTACH_MILLI);
 
   if(button == 1) {
@@ -177,14 +303,59 @@ BLYNK_WRITE(V5) // slider open
   //Blynk.virtualWrite(V4, t);
 }
 
+BLYNK_WRITE(V6)
+{
+
+  // if you type "Marco" into Terminal Widget - it will respond: "Polo:"
+  if (String("Marco") == param.asStr()) {
+    terminal.println("You said: 'Marco'") ;
+    terminal.println("I said: 'Polo'") ;
+  } else {
+
+    // Send it back
+    terminal.print("You said:");
+    terminal.write(param.getBuffer(), param.getLength());
+    terminal.println();
+  }
+
+  // Ensure everything is sent
+  terminal.flush();
+}
+
+void setupTerminal() 
+{
+    // Clear the terminal content
+  terminal.clear();
+
+  // This will print Blynk Software version to the Terminal Widget when
+  // your hardware gets connected to Blynk Server
+  terminal.println(F("Blynk v" BLYNK_VERSION ": Device started"));
+  terminal.println(F("-------------"));
+  terminal.println(F("Type 'Marco' and get a reply, or type"));
+  terminal.println(F("anything else and get it printed back."));
+  terminal.flush();
+}
+
+/* ------------------------------------------------------ 
+ *  Main arduino setup and loop functions
+ * ------------------------------------------------------ */
+ 
 void setup()
 {
   // Debug console
-  Serial.begin(9600);
-  
+  Serial.begin(74880);
   pinMode(LED_BUILTIN, OUTPUT);
+
+  // Setup wifi and blynk
+  WiFi.begin(ssid, pass);
+ 
+  while ( WiFi.status() != WL_CONNECTED ) {
+    delay ( 500 );
+    Serial.print ( "." );
+  }
   Blynk.begin(auth, ssid, pass);
-  
+
+  // setup persistent memory
   EEPROM.begin(16);
 
   // initialize with known positions
@@ -193,10 +364,20 @@ void setup()
   int init_angle = readEEPROM(S_PREV_A);
   s_door.writeMicroseconds(init_milli);
   s_slider.write(init_angle);
-  
+
+  // setup temp sensor
   //dht.begin();
 
+  // set initial time and timer
+  timeClient.begin(); 
+  setTime(timeClient.getEpochTime()); 
+  timer.every(TIMER_INTERVAL_SEC * 1000, updateTimeAndDoTask);
 
+  setupTerminal();
+
+  // setup OTA update
+  // TODO: enable security
+  
   // Port defaults to 8266
   // ArduinoOTA.setPort(8266);
   
@@ -246,6 +427,7 @@ void setup()
 
 void loop()
 {
+  timer.tick();
   Blynk.run();
   ArduinoOTA.handle();
 }
