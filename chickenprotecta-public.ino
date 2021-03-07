@@ -79,6 +79,7 @@ Timezone CE(CEST, CET);
 // used as mutex, but not thread safe on arduino, should be ok IMO
 bool moving_door = false;
 void move_door(int button);
+bool manual_override = false;
 
 /* ------------------------------------------------------
    EEPROM helper functions
@@ -185,9 +186,22 @@ bool updateTimeAndDoTask(void *) {
     setTime(timeClient.getEpochTime());
   } else {
     Serial.println ( "NTP Update not WORK!!" );
+    return true;
   }
 
+  // according to timezone
   bool doorUp = isDoorUp();
+
+  // we shouldn't revers a manual open/close, however the opposite should still work
+  if (manual_override) {
+    if (get_door_position() != doorUp) {
+      return true;
+    } else {
+      // reset manual override
+      manual_override = false;
+    }
+  }
+
   if (!moving_door)
     move_door(doorUp);
 
@@ -214,9 +228,7 @@ BLYNK_WRITE(V0) // door min
 {
   int data = param.asInt();
   Serial.printf("V0 %d\n", data);
-  // s_door.writeMicroseconds(data);
   writeEEPROM(D_CLOSE_A, data);
-  // writeEEPROM(D_PREV_A, data);
 
 }
 
@@ -224,9 +236,7 @@ BLYNK_WRITE(V1) // door max
 {
   int data = param.asInt();
   Serial.printf("V1 %d\n", data);
-  //s_door.writeMicroseconds(data);
   writeEEPROM(D_OPEN_A, data);
-  // writeEEPROM(D_PREV_A, data);
 
 }
 
@@ -333,8 +343,10 @@ void move_door(int button)
 BLYNK_WRITE(V2)
 {
   int button = param.asInt();
-  if (!moving_door)
+  if (!moving_door) {
+    manual_override = true;
     move_door(button);
+  }
 }
 
 BLYNK_WRITE(V3) // slider close
@@ -343,7 +355,6 @@ BLYNK_WRITE(V3) // slider close
   Serial.printf("V2 %d\n", angle);
   s_slider.write(angle);
   writeEEPROM(S_CLOSE_A, angle);
-  //writeEEPROM(S_PREV_A, angle);
 }
 BLYNK_WRITE(V5) // slider open
 {
@@ -351,7 +362,6 @@ BLYNK_WRITE(V5) // slider open
   Serial.printf("V5 %d\n", angle);
   s_slider.write(angle);
   writeEEPROM(S_OPEN_A, angle);
-  //writeEEPROM(S_PREV_A, angle);
 }
 BLYNK_READ(V4)
 {
@@ -466,7 +476,9 @@ void setup()
 
   // set initial time and timer
   timeClient.begin();
-  setTime(timeClient.getEpochTime());
+  if(timeClient.update()) {
+    setTime(timeClient.getEpochTime());
+  }
   timer.every(TIMER_INTERVAL_SEC * 1000, updateTimeAndDoTask);
 
   // setup OTA update
